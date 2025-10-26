@@ -1,212 +1,107 @@
-# utils/preprocess_no_sentimen.py (versi revisi)
-import pandas as pd
+# utils/predict_no_sentimen.py (versi final - hybrid scaler + Kalman + auto plot)
+import os
+import joblib
 import numpy as np
-from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
-from numpy.lib.stride_tricks import sliding_window_view
-from typing import Tuple, Optional, List, Dict
-from config import (
-    DATE_COL, TARGET_COL, N_STEPS, H_1M,
-    TRAIN_RATIO, VAL_RATIO,
-    MA_PERIODS, EMA_PERIODS, RSI_PERIODS, MACD_CONFIGS
-)
-
-# ========================
-# 1. Load CSV
-# ========================
-def load_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
-    df = df.dropna(subset=[DATE_COL]).sort_values(DATE_COL)
-    return df
+import pandas as pd
+import matplotlib.pyplot as plt
+from tensorflow.keras.models import load_model
+from utils.preprocess_no_sentimen import add_indicators, prepare_sequences
+from utils.kalman import apply_kalman_filter  # ✅ gunakan modul eksternal kamu
+from config import TARGET_COL, H_1M, N_STEPS
 
 
-# ========================
-# 2. Tambahkan Return
-# ========================
-def add_simple_returns(df: pd.DataFrame) -> pd.DataFrame:
-    """Tambah kolom Return per Ticker agar skala lintas emiten comparable."""
-    df = df.sort_values(["Ticker", DATE_COL])
-    df["Return"] = df.groupby("Ticker")[TARGET_COL].pct_change()
-    return df
-
-
-# ========================
-# 3. Ambil fitur numerik (tanpa target)
-# ========================
-def select_numeric_matrix(df: pd.DataFrame, target_col: str, feature_subset: Optional[List[str]] = None) -> Tuple[np.ndarray, List[str]]:
+# ======================================================
+# Inverse transform hanya fitur harga
+# ======================================================
+def inverse_transform_price_only(y_scaled: np.ndarray, scaler_dict: dict):
     """
-    Ambil subset fitur numerik jadi matrix numpy.
+    Mengembalikan hasil prediksi ke skala harga asli (Rupiah)
+    menggunakan scaler 'price' dari scaler_dict.
     """
-    drop_cols = [DATE_COL, target_col]
-    num_df = df.drop(columns=drop_cols, errors="ignore").select_dtypes(include=[np.number])
+    if "price" not in scaler_dict:
+        raise ValueError("Scaler untuk 'price' tidak ditemukan di scaler_dict.")
+    scaler = scaler_dict["price"]
 
-    if feature_subset:
-        available = [f for f in feature_subset if f in num_df.columns]
-        num_df = num_df[available]
+    if y_scaled.ndim == 1:
+        y_scaled = y_scaled.reshape(-1, 1)
 
-    return num_df.values.astype(float), list(num_df.columns)
+    y_real = scaler.inverse_transform(y_scaled)
+    return y_real
 
 
-# ========================
-# 4. Scaling (Standard untuk harga, Robust untuk Volume)
-# ========================
-def fit_scale(data: pd.DataFrame, scaler_dict: Optional[Dict[str, object]] = None, fit: bool = True):
+# ======================================================
+# Fungsi utama prediksi
+# ======================================================
+def predict_next(prices_path: str, model_path: str, feature_subset: list, out_dir: str = "predictions"):
     """
-    Scaling hybrid:
-    - StandardScaler untuk fitur harga (Close, High, Low)
-    - RobustScaler untuk Volume
-    - MinMaxScaler fallback untuk indikator teknikal (RSI, MA, EMA, MACD, dll.)
+    Melakukan prediksi harga saham menggunakan model dan scaler hasil training.
+    Termasuk smoothing hasil prediksi dengan Kalman filter dan visualisasi.
     """
-    scaler_dict = scaler_dict or {}
-    df_scaled = data.copy()
+    ticker = os.path.splitext(os.path.basename(prices_path))[0]
+    print(f"📈 Mulai prediksi untuk {ticker}")
 
-    # Inisialisasi scaler
-    if fit:
-        scaler_dict["price"] = StandardScaler()
-        scaler_dict["volume"] = RobustScaler()
-        scaler_dict["indicator"] = MinMaxScaler()  # opsional untuk fitur indikator
+    # --- 1️⃣ Load data saham dan tambahkan indikator teknikal ---
+    df = pd.read_csv(prices_path)
+    df = add_indicators(df)
 
-        # --- Fit tiap kelompok fitur ---
-        price_cols = [c for c in data.columns if c.lower() in ["close", "high", "low"]]
-        volume_cols = [c for c in data.columns if "volume" in c.lower()]
-        indicator_cols = [c for c in data.columns if c not in price_cols + volume_cols]
+    # --- 2️⃣ Load model & scaler ---
+    model = load_model(model_path)
+    scaler_path = model_path.replace("_best_price.keras", "_scaler.pkl")
+    if not os.path.exists(scaler_path):
+        raise FileNotFoundError(f"Scaler file tidak ditemukan: {scaler_path}")
 
-        if price_cols:
-            df_scaled[price_cols] = scaler_dict["price"].fit_transform(data[price_cols])
-        if volume_cols:
-            df_scaled[volume_cols] = scaler_dict["volume"].fit_transform(data[volume_cols])
-        if indicator_cols:
-            df_scaled[indicator_cols] = scaler_dict["indicator"].fit_transform(data[indicator_cols])
+    scaler_dict = joblib.load(scaler_path)
+    print(f"✅ Model & scaler berhasil dimuat untuk {ticker}")
 
-    else:
-        # Transform pakai scaler lama
-        if "price" in scaler_dict:
-            price_cols = [c for c in data.columns if c.lower() in ["close", "high", "low"]]
-            df_scaled[price_cols] = scaler_dict["price"].transform(data[price_cols])
-        if "volume" in scaler_dict:
-            volume_cols = [c for c in data.columns if "volume" in c.lower()]
-            df_scaled[volume_cols] = scaler_dict["volume"].transform(data[volume_cols])
-        if "indicator" in scaler_dict:
-            indicator_cols = [c for c in data.columns if c not in price_cols + volume_cols]
-            df_scaled[indicator_cols] = scaler_dict["indicator"].transform(data[indicator_cols])
+    # --- 3️⃣ Siapkan sequence terakhir (N_STEPS terakhir) ---
+    try:
+        X_all, _, _, _ = prepare_sequences(
+            df, TARGET_COL, H_1M, feature_subset=feature_subset, scaler_dict=scaler_dict
+        )
+    except Exception as e:
+        raise RuntimeError(f"Gagal menyiapkan data untuk prediksi: {e}")
 
-    return df_scaled, scaler_dict
+    X_latest = X_all[-1:]  # window terakhir (misal 60 hari terakhir)
 
+    # --- 4️⃣ Prediksi ---
+    y_pred_scaled = model.predict(X_latest)
+    y_pred_real = inverse_transform_price_only(y_pred_scaled.reshape(-1, 1), scaler_dict).flatten()
 
-# ========================
-# 5. Siapkan sequence (windowing)
-# ========================
-def prepare_sequences(
-    df: pd.DataFrame,
-    target_col_name: str,
-    horizon: int = H_1M,
-    feature_subset: Optional[List[str]] = None,
-    scaler_dict: Optional[Dict[str, object]] = None,
-    step_size: int = 1,
-):
-    print(f"\n[DEBUG] Mulai prepare_sequences target={target_col_name}, horizon={horizon}, fitur={feature_subset}")
+    # --- 5️⃣ Terapkan Kalman filter ---
+    try:
+        y_smooth = apply_kalman_filter(y_pred_real)
+        print("✨ Kalman smoothing berhasil diterapkan.")
+    except Exception as e:
+        print(f"⚠️ Gagal menerapkan Kalman filter: {e}")
+        y_smooth = y_pred_real  # fallback ke hasil asli
 
-    # ambil input (pakai subset kalau ada)
-    data_num, cols = select_numeric_matrix(df, target_col=target_col_name, feature_subset=feature_subset)
-    data_df = pd.DataFrame(data_num, columns=cols)
+    # --- 6️⃣ Simpan hasil ke CSV ---
+    os.makedirs(out_dir, exist_ok=True)
+    out_csv = os.path.join(out_dir, f"{ticker}_prediction.csv")
 
-    # scaling
-    fit_mode = scaler_dict is None
-    data_scaled_df, scaler_dict = fit_scale(data_df, scaler_dict, fit=fit_mode)
+    result_df = pd.DataFrame({
+        "Ticker": [ticker] * len(y_pred_real),
+        "Predicted_Close_Raw": y_pred_real,
+        "Predicted_Close_Smoothed": y_smooth
+    })
+    result_df.to_csv(out_csv, index=False)
 
-    data_scaled = data_scaled_df.values
-    tgt = df[target_col_name].values
+    print(f"💾 Hasil prediksi disimpan ke: {out_csv}")
 
-    T, F = data_scaled.shape
-    needed = N_STEPS + horizon
-    if T < needed:
-        raise ValueError(f"Data terlalu pendek. Perlu ≥ {needed}, ada {T}")
+    # --- 7️⃣ Plot hasil prediksi ---
+    plt.figure(figsize=(8, 4))
+    plt.plot(range(1, H_1M + 1), y_pred_real, marker="o", label="Prediksi (Raw)")
+    plt.plot(range(1, H_1M + 1), y_smooth, marker="s", label="Prediksi (Kalman)", linestyle="--")
+    plt.title(f"Prediksi Harga {ticker} {H_1M} Hari Kedepan")
+    plt.xlabel("Hari ke-")
+    plt.ylabel("Harga Prediksi (Rupiah)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    out_png = os.path.join(out_dir, f"{ticker}_prediction.png")
+    plt.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.close()
 
-    # buat window X
-    X_full = sliding_window_view(data_scaled, (N_STEPS, F))[:, 0, :, :]
+    print(f"🖼️ Grafik prediksi disimpan ke: {out_png}")
+    print(f"✅ Prediksi selesai untuk {ticker} — Output: {len(y_pred_real)} hari (raw + smoothed)")
 
-    # buat y (horizon)
-    y_list = []
-    max_start = T - (N_STEPS + horizon) + 1
-    for s in range(0, max_start, step_size):
-        y_list.append(tgt[s + N_STEPS : s + N_STEPS + horizon])
-    X = X_full[:max_start:step_size]
-    y = np.stack(y_list, axis=0)
-
-    print(f"[DEBUG] Final X shape: {X.shape}, y shape: {y.shape}")
-    return X, y, scaler_dict, cols
-
-
-# ========================
-# 6. Split data (train/val/test)
-# ========================
-def time_split_hybrid(df: pd.DataFrame,
-                      train_end: str, val_end: str,
-                      start_date_expected="2015-03-02",
-                      train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO,
-                      min_needed: int = None):
-    """
-    Hybrid split:
-    - Jika data dimulai tepat dari start_date_expected → pakai split tanggal.
-    - Jika tidak → pakai split proporsi.
-    - Jika hasil split terlalu pendek → fallback ke proporsi.
-    """
-    df = df.sort_values(DATE_COL).reset_index(drop=True)
-    start_actual = df[DATE_COL].min().date()
-    print(f"\n[DEBUG] Mulai time_split_hybrid, start_actual={start_actual}, rows={len(df)}")
-
-    if min_needed is None:
-        min_needed = N_STEPS + H_1M
-
-    if str(start_actual) == start_date_expected:
-        tr = df[df[DATE_COL] <= pd.Timestamp(train_end)]
-        va = df[(df[DATE_COL] > pd.Timestamp(train_end)) & (df[DATE_COL] <= pd.Timestamp(val_end))]
-        te = df[df[DATE_COL] > pd.Timestamp(val_end)]
-        mode = "date"
-    else:
-        n = len(df)
-        n_train = int(train_ratio * n)
-        n_val = int(val_ratio * n)
-        tr = df.iloc[:n_train]
-        va = df.iloc[n_train:n_train+n_val]
-        te = df.iloc[n_train+n_val:]
-        mode = "ratio"
-
-    print(f"[DEBUG] Split mode={mode}, train={len(tr)}, val={len(va)}, test={len(te)}")
-    return tr, va, te, mode
-
-
-# ========================
-# 7. Indikator teknikal (MA, EMA, RSI, MACD + lag)
-# ========================
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # MA
-    for p in MA_PERIODS:
-        df[f"MA{p}"] = df[TARGET_COL].rolling(p).mean()
-
-    # EMA
-    for p in EMA_PERIODS:
-        df[f"EMA{p}"] = df[TARGET_COL].ewm(span=p, adjust=False).mean()
-
-    # RSI
-    for p in RSI_PERIODS:
-        delta = df[TARGET_COL].diff()
-        gain = delta.clip(lower=0).rolling(p).mean()
-        loss = -delta.clip(upper=0).rolling(p).mean()
-        rs = gain / (loss + 1e-9)
-        df[f"RSI{p}"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    for fast, slow in MACD_CONFIGS:
-        ema_fast = df[TARGET_COL].ewm(span=fast, adjust=False).mean()
-        ema_slow = df[TARGET_COL].ewm(span=slow, adjust=False).mean()
-        df[f"MACD_{fast}_{slow}"] = ema_fast - ema_slow
-
-    # Lag fitur
-    for lag in range(1, 4):
-        df[f"{TARGET_COL}_lag{lag}"] = df[TARGET_COL].shift(lag)
-
-    df = df.dropna().reset_index(drop=True)
-    return df
+    return result_df
