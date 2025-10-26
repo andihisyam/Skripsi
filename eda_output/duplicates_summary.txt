@@ -1,0 +1,61 @@
+st.markdown("""
+    <style>
+    .note-box {
+        background-color: #eaf4ff;
+        padding: 18px 20px;
+        border-radius: 12px;
+        font-size: 16px;
+        line-height: 1.6;
+        color: #1e293b;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+        margin-bottom: 20px;
+        animation: fadeIn 0.5s ease-in-out;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    .note-box:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    }
+    .note-box h4 {
+        margin-top: 0;
+        margin-bottom: 8px;
+        font-size: 18px;
+        font-weight: 600;
+        color: #0369a1;
+    }
+    .note-subtitle {
+        margin-top: 10px;
+        margin-bottom: 6px;
+        font-size: 15px;
+        font-weight: 500;
+        color: #0f766e;
+    }
+    .note-box ul {
+        margin: 8px 0 12px 20px;
+        padding: 0;
+    }
+    .note-box li {
+        margin-bottom: 6px;
+    }
+    </style>
+
+    <div class="note-box">
+        <h4>📘 Verifikasi Pending → Pending Baru + Invalid</h4>
+        <div class="note-subtitle">📌 Cara Pemakaian</div>
+        Digunakan untuk memproses <b>BAHV BPJS ke-2</b> atau file pending tahap kedua.<br>
+        Tujuannya:
+        <ul>
+            <li>Menentukan mana SEP pending di BAHV pertama yang <b>sudah masuk Reguler</b></li>
+            <li>Menentukan mana SEP yang benar-benar <b>Invalid klaim BPJS</b></li>
+        </ul>
+    </div>
+
+    <div class="note-box">
+        <h4>📗 Pisahkan Hasil CPPT → Reguler & Pending</h4>
+        <div class="note-subtitle">📌 Cara Pemakaian</div>
+        <ul>
+            <li> Digunakan untuk memproses <b>dokumen DPJP yang baru mendapat BAHV pertama</b> di bulan tersebut.<br> </li>
+            <li> Dipilih jika <b>DPJP sudah ditentukan sebelum BPJS mengirimkan BAHV umpan balik pertama</b>. </li>
+        </ul>
+    </div>
+""", unsafe_allow_html=True)
