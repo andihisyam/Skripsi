@@ -9,6 +9,7 @@ from datetime import date
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+import joblib
 
 from sklearn.metrics import mean_absolute_percentage_error, r2_score, root_mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
@@ -151,7 +152,7 @@ FEATURE_COMBINATIONS = {
 }
 
 # ======================================================
-# Fungsi bantu
+# 2️⃣ Fungsi bantu
 # ======================================================
 def determine_test_size(df: pd.DataFrame) -> Tuple[int, str]:
     """Menentukan ukuran test adaptif tergantung panjang data."""
@@ -160,18 +161,14 @@ def determine_test_size(df: pd.DataFrame) -> Tuple[int, str]:
     start_actual = df[DATE_COL].min().date()
     total_rows = len(df)
 
-    # === [UPDATE] Versi lebih adaptif ===
     adaptive_size = max(int(total_rows * 0.15), MIN_NEEDED + 20)
 
-    # Kasus jika datanya lengkap (misal saham lama seperti BBRI)
     if start_actual == START_DATE_EXPECTED and total_rows > 1000:
         return adaptive_size, "adaptive_15%"
-    # Kasus jika data pendek (IPO baru)
     elif total_rows <= MIN_NEEDED * 3:
         return MIN_NEEDED + 20, "min_window_safe"
     else:
         return adaptive_size, "adaptive_default"
-
 
 
 def build_lstm_model(input_shape: Tuple[int, int]) -> tf.keras.Model:
@@ -205,14 +202,14 @@ def plot_loss_curve(history, t, comb_name, fold, best_epoch, pdf):
 
 
 # ======================================================
-# Fungsi utama training
+# 3️⃣ Fungsi utama training per ticker dan subset
 # ======================================================
-def train_each(data_dir="../Data/Saham", out_dir="models", tickers_filter=None,subset_filter=None):
+def train_each(data_dir="../Data/Saham", out_dir="models", tickers_filter=None, subset_filter=None):
     DATA_DIR = Path(data_dir)
     if not DATA_DIR.exists():
         raise SystemExit(f"❌ Folder tidak ditemukan: {DATA_DIR.resolve()}")
 
-    # 1️⃣ Load data dan pra-pemrosesan
+    # --- Load dan tambah indikator ---
     prices = load_prices_from_folder(str(DATA_DIR))
     prices = add_simple_returns(prices)
     prices = add_indicators(prices)
@@ -224,13 +221,12 @@ def train_each(data_dir="../Data/Saham", out_dir="models", tickers_filter=None,s
 
     logs = []
 
-    # 2️⃣ Loop kombinasi fitur
     for comb_name, feature_subset in FEATURE_COMBINATIONS.items():
         if subset_filter and comb_name not in subset_filter:
             continue
         print(f"\n================= Mulai training kombinasi fitur: {comb_name} =================")
 
-        # Buat PDF terpisah per kombinasi fitur
+        # Buat PDF loss curve
         pdf_path = os.path.join(out_dir, f"loss_curves_{comb_name}.pdf")
         pdf = PdfPages(pdf_path)
         pdf.infodict().update({
@@ -251,22 +247,28 @@ def train_each(data_dir="../Data/Saham", out_dir="models", tickers_filter=None,s
 
             best_model = None
             best_val_loss_global = float("inf")
-            best_fold_info = None
+            best_scaler_dict = None
 
             for fold, (train_idx, val_idx) in enumerate(tscv.split(p_i)):
                 tr, va = p_i.iloc[train_idx], p_i.iloc[val_idx]
                 print(f"[{t}] Fold {fold+1}: Train={len(tr)}, Val={len(va)}")
 
                 try:
-                    Xtr, ytr, scaler, _ = prepare_sequences(tr, TARGET_COL, H_1M, feature_subset)
-                    Xva, yva, _, _ = prepare_sequences(va, TARGET_COL, H_1M, feature_subset, scaler=scaler)
+                    Xtr, ytr, scaler_dict, _ = prepare_sequences(tr, TARGET_COL, H_1M, feature_subset)
+                    Xva, yva, _, _ = prepare_sequences(va, TARGET_COL, H_1M, feature_subset, scaler_dict=scaler_dict)
                 except Exception as e:
                     print(f"⚠️ Skip {t} (fold={fold+1}, fitur={comb_name}): {e}")
                     continue
 
                 model = build_lstm_model((N_STEPS, Xtr.shape[-1]))
-                history = model.fit(Xtr, ytr, validation_data=(Xva, yva),
-                                    epochs=100, batch_size=32, verbose=1)
+                history = model.fit(
+                    Xtr, ytr,
+                    validation_data=(Xva, yva),
+                    epochs=100,
+                    batch_size=32,
+                    verbose=1,
+                    callbacks=[tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)]
+                )
 
                 # Evaluasi
                 yva_pred = model.predict(Xva, verbose=0)
@@ -279,8 +281,7 @@ def train_each(data_dir="../Data/Saham", out_dir="models", tickers_filter=None,s
                 best_val_loss = val_losses[best_epoch]
                 best_val_mae = history.history["val_mae"][best_epoch]
 
-                print(f"[{t}] Fold {fold+1}: Best Epoch={best_epoch+1}, "
-                    f"Val_Loss={best_val_loss:.6f}, Val_MAE={best_val_mae:.6f}")
+                print(f"[{t}] Fold {fold+1}: Best Epoch={best_epoch+1}, Val_Loss={best_val_loss:.6f}, Val_MAE={best_val_mae:.6f}")
 
                 logs.append({
                     "Ticker": t,
@@ -297,30 +298,28 @@ def train_each(data_dir="../Data/Saham", out_dir="models", tickers_filter=None,s
                 # Plot Loss Curve
                 plot_loss_curve(history, t, comb_name, fold, best_epoch, pdf)
 
-                # Simpan model terbaik global
+                # Simpan model terbaik global per ticker
                 if best_val_loss < best_val_loss_global:
                     best_val_loss_global = best_val_loss
                     best_model = model
-                    best_fold_info = {
-                        "Fold": fold + 1,
-                        "Best_Epoch": best_epoch + 1,
-                        "Val_Loss": best_val_loss,
-                        "Val_MAE": best_val_mae,
-                    }
+                    best_scaler_dict = scaler_dict
 
-            # Setelah semua fold
+            # Simpan model + scaler
             if best_model is not None:
                 save_dir = os.path.join(out_dir, comb_name)
                 os.makedirs(save_dir, exist_ok=True)
-                out_name = os.path.join(save_dir, f"{t}_best_price.keras")
-                best_model.save(out_name)
-                print(f"[{t}] ✅ Model terbaik (Fold {best_fold_info['Fold']}) disimpan ke: {out_name}")
+                model_path = os.path.join(save_dir, f"{t}_best_price.keras")
+                scaler_path = os.path.join(save_dir, f"{t}_scaler.pkl")
 
-        # Tutup PDF untuk kombinasi ini
+                best_model.save(model_path)
+                joblib.dump(best_scaler_dict, scaler_path)
+
+                print(f"[{t}] ✅ Model dan scaler disimpan di: {model_path}, {scaler_path}")
+
         pdf.close()
         print(f"[LOG] Semua loss curve untuk fitur {comb_name} disimpan di: {pdf_path}")
 
-    # 3️⃣ Simpan log ke CSV dan buat summary Excel
+    # Simpan log hasil training
     log_path = os.path.join(out_dir, "training_summary.csv")
     pd.DataFrame(logs).to_csv(log_path, index=False)
     print(f"[LOG] Ringkasan hasil training disimpan ke: {log_path}")
