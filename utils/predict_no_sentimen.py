@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from tensorflow.keras.models import load_model
 from utils.preprocess_no_sentimen import add_indicators, prepare_sequences
-from utils.kalman import apply_kalman_filter  # ✅ gunakan modul eksternal kamu
+from utils.kalman import apply_kalman_filter  
 from config import TARGET_COL, H_1M, N_STEPS
 
 
