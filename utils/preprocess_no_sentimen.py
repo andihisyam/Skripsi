@@ -53,88 +53,91 @@ def select_numeric_matrix(df: pd.DataFrame, target_col: str, feature_subset: Opt
 def fit_scale(data: pd.DataFrame, scaler_dict: Optional[Dict[str, object]] = None, fit: bool = True):
     """
     Scaling hybrid:
-    - StandardScaler untuk fitur harga (Close, High, Low)
+    - StandardScaler untuk fitur harga (Open, Close, High, Low dan lag-nya)
     - RobustScaler untuk Volume
     - MinMaxScaler fallback untuk indikator teknikal (RSI, MA, EMA, MACD, dll.)
     """
+
     scaler_dict = scaler_dict or {}
     df_scaled = data.copy()
 
-    # Inisialisasi scaler
+    # =========================
+    # 🔍 DEBUG 1 — tampilkan semua kolom masuk
+    # =========================
+    print("\n[DEBUG] 🔍 Masuk ke fit_scale()")
+    print(f"[DEBUG] Kolom input data: {list(data.columns)}")
+
+    # =========================
+    #  Inisialisasi scaler
+    # =========================
     if fit:
         scaler_dict["price"] = StandardScaler()
         scaler_dict["volume"] = RobustScaler()
-        scaler_dict["indicator"] = MinMaxScaler()  # opsional untuk fitur indikator
+        scaler_dict["indicator"] = MinMaxScaler()
 
-        # --- Fit tiap kelompok fitur ---
-        price_cols = [c for c in data.columns if c.lower() in ["close", "high", "low"]]
+        # ✅ Gunakan deteksi substring biar lag ikut terbaca
+        price_cols = [c for c in data.columns if any(k in c.lower() for k in ["open", "close", "high", "low"])]
         volume_cols = [c for c in data.columns if "volume" in c.lower()]
         indicator_cols = [c for c in data.columns if c not in price_cols + volume_cols]
 
+        # =========================
+        # 🔍 DEBUG 2 — tampilkan grouping
+        # =========================
+        print(f"[DEBUG] Deteksi price_cols: {price_cols}")
+        print(f"[DEBUG] Deteksi volume_cols: {volume_cols}")
+        print(f"[DEBUG] Deteksi indicator_cols: {indicator_cols}")
+
+        # Fit tiap kelompok fitur
         if price_cols:
             df_scaled[price_cols] = scaler_dict["price"].fit_transform(data[price_cols])
+            print(f"[DEBUG] ✅ Scaler 'price' di-fit untuk {len(price_cols)} kolom.")
+        else:
+            print("[DEBUG] ⚠️ Tidak ada kolom harga terdeteksi untuk scaler 'price'.")
+
         if volume_cols:
             df_scaled[volume_cols] = scaler_dict["volume"].fit_transform(data[volume_cols])
+            print(f"[DEBUG] ✅ Scaler 'volume' di-fit untuk {len(volume_cols)} kolom.")
+        else:
+            print("[DEBUG] ⚠️ Tidak ada kolom volume terdeteksi untuk scaler 'volume'.")
+
         if indicator_cols:
             df_scaled[indicator_cols] = scaler_dict["indicator"].fit_transform(data[indicator_cols])
+            print(f"[DEBUG] ✅ Scaler 'indicator' di-fit untuk {len(indicator_cols)} kolom.")
+        else:
+            print("[DEBUG] ⚠️ Tidak ada kolom indikator terdeteksi untuk scaler 'indicator'.")
 
     else:
+        # =========================
         # Transform pakai scaler lama
-        if "price" in scaler_dict:
-            price_cols = [c for c in data.columns if c.lower() in ["close", "high", "low"]]
+        # =========================
+        price_cols = [c for c in data.columns if any(k in c.lower() for k in ["open", "close", "high", "low"])]
+        volume_cols = [c for c in data.columns if "volume" in c.lower()]
+        indicator_cols = [c for c in data.columns if c not in price_cols + volume_cols]
+
+        print(f"[DEBUG] (Transform mode) price_cols: {price_cols}")
+        print(f"[DEBUG] (Transform mode) volume_cols: {volume_cols}")
+        print(f"[DEBUG] (Transform mode) indicator_cols: {indicator_cols}")
+
+        if "price" in scaler_dict and price_cols:
             df_scaled[price_cols] = scaler_dict["price"].transform(data[price_cols])
-        if "volume" in scaler_dict:
-            volume_cols = [c for c in data.columns if "volume" in c.lower()]
+        else:
+            print("[DEBUG] ⚠️ Skip transform price — tidak ada kolom atau scaler belum di-fit.")
+
+        if "volume" in scaler_dict and volume_cols:
             df_scaled[volume_cols] = scaler_dict["volume"].transform(data[volume_cols])
-        if "indicator" in scaler_dict:
-            indicator_cols = [c for c in data.columns if c not in price_cols + volume_cols]
+        else:
+            print("[DEBUG] ⚠️ Skip transform volume — tidak ada kolom atau scaler belum di-fit.")
+
+        if "indicator" in scaler_dict and indicator_cols:
             df_scaled[indicator_cols] = scaler_dict["indicator"].transform(data[indicator_cols])
+        else:
+            print("[DEBUG] ⚠️ Skip transform indicator — tidak ada kolom atau scaler belum di-fit.")
+
+    print(f"[DEBUG] ✅ Total kolom output setelah scaling: {len(df_scaled.columns)}")
+    print("[DEBUG] ✅ Selesai fit_scale()\n")
 
     return df_scaled, scaler_dict
 
-
-# ========================
-# 5. Siapkan sequence (windowing)
-# ========================
-def prepare_sequences(
-    df: pd.DataFrame,
-    target_col_name: str,
-    horizon: int = H_1M,
-    feature_subset: Optional[List[str]] = None,
-    scaler_dict: Optional[Dict[str, object]] = None,
-    step_size: int = 1,
-):
-    print(f"\n[DEBUG] Mulai prepare_sequences target={target_col_name}, horizon={horizon}, fitur={feature_subset}")
-
-    # ambil input (pakai subset kalau ada)
-    data_num, cols = select_numeric_matrix(df, target_col=target_col_name, feature_subset=feature_subset)
-    data_df = pd.DataFrame(data_num, columns=cols)
-
-    # scaling
-    fit_mode = scaler_dict is None
-    data_scaled_df, scaler_dict = fit_scale(data_df, scaler_dict, fit=fit_mode)
-
-    data_scaled = data_scaled_df.values
-    tgt = df[target_col_name].values
-
-    T, F = data_scaled.shape
-    needed = N_STEPS + horizon
-    if T < needed:
-        raise ValueError(f"Data terlalu pendek. Perlu ≥ {needed}, ada {T}")
-
-    # buat window X
-    X_full = sliding_window_view(data_scaled, (N_STEPS, F))[:, 0, :, :]
-
-    # buat y (horizon)
-    y_list = []
-    max_start = T - (N_STEPS + horizon) + 1
-    for s in range(0, max_start, step_size):
-        y_list.append(tgt[s + N_STEPS : s + N_STEPS + horizon])
-    X = X_full[:max_start:step_size]
-    y = np.stack(y_list, axis=0)
-
-    print(f"[DEBUG] Final X shape: {X.shape}, y shape: {y.shape}")
-    return X, y, scaler_dict, cols
 
 
 # ========================
