@@ -138,6 +138,48 @@ def fit_scale(data: pd.DataFrame, scaler_dict: Optional[Dict[str, object]] = Non
 
     return df_scaled, scaler_dict
 
+# ========================
+# 5. Siapkan sequence (windowing)
+# ========================
+def prepare_sequences(
+    df: pd.DataFrame,
+    target_col_name: str,
+    horizon: int = H_1M,
+    feature_subset: Optional[List[str]] = None,
+    scaler_dict: Optional[Dict[str, object]] = None,
+    step_size: int = 1,
+):
+    print(f"\n[DEBUG] Mulai prepare_sequences target={target_col_name}, horizon={horizon}, fitur={feature_subset}")
+
+    # ambil input (pakai subset kalau ada)
+    data_num, cols = select_numeric_matrix(df, target_col=target_col_name, feature_subset=feature_subset)
+    data_df = pd.DataFrame(data_num, columns=cols)
+
+    # scaling
+    fit_mode = scaler_dict is None
+    data_scaled_df, scaler_dict = fit_scale(data_df, scaler_dict, fit=fit_mode)
+
+    data_scaled = data_scaled_df.values
+    tgt = df[target_col_name].values
+
+    T, F = data_scaled.shape
+    needed = N_STEPS + horizon
+    if T < needed:
+        raise ValueError(f"Data terlalu pendek. Perlu ≥ {needed}, ada {T}")
+
+    # buat window X
+    X_full = sliding_window_view(data_scaled, (N_STEPS, F))[:, 0, :, :]
+
+    # buat y (horizon)
+    y_list = []
+    max_start = T - (N_STEPS + horizon) + 1
+    for s in range(0, max_start, step_size):
+        y_list.append(tgt[s + N_STEPS : s + N_STEPS + horizon])
+    X = X_full[:max_start:step_size]
+    y = np.stack(y_list, axis=0)
+
+    print(f"[DEBUG] Final X shape: {X.shape}, y shape: {y.shape}")
+    return X, y, scaler_dict, cols
 
 
 # ========================
