@@ -256,6 +256,14 @@ def train_each(data_dir="../Data/Saham", out_dir="models", tickers_filter=None, 
                 try:
                     Xtr, ytr, scaler_dict, _ = prepare_sequences(tr, TARGET_COL, H_1M, feature_subset)
                     Xva, yva, _, _ = prepare_sequences(va, TARGET_COL, H_1M, feature_subset, scaler_dict=scaler_dict)
+
+                    # ✅ Tambahkan scaler khusus untuk kolom target (Close)
+                    if "target_close" not in scaler_dict:
+                        from sklearn.preprocessing import StandardScaler
+                        scaler_close = StandardScaler()
+                        scaler_close.fit(ytr.reshape(-1, 1))
+                        scaler_dict["target_close"] = scaler_close
+
                 except Exception as e:
                     print(f"⚠️ Skip {t} (fold={fold+1}, fitur={comb_name}): {e}")
                     continue
