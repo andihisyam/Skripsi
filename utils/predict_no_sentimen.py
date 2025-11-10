@@ -16,16 +16,24 @@ from config import TARGET_COL, H_1M, N_STEPS
 def inverse_transform_price_only(y_scaled: np.ndarray, scaler_dict: dict):
     """
     Mengembalikan hasil prediksi ke skala harga asli (Rupiah)
-    menggunakan scaler 'price' dari scaler_dict.
+    menggunakan scaler 'target_close' jika tersedia,
+    atau fallback ke scaler 'price' (kolom pertama).
     """
-    if "price" not in scaler_dict:
-        raise ValueError("Scaler untuk 'price' tidak ditemukan di scaler_dict.")
-    scaler = scaler_dict["price"]
-
     if y_scaled.ndim == 1:
         y_scaled = y_scaled.reshape(-1, 1)
 
-    y_real = scaler.inverse_transform(y_scaled)
+    if "target_close" in scaler_dict:
+        scaler = scaler_dict["target_close"]
+        y_real = scaler.inverse_transform(y_scaled)
+    else:
+        scaler = scaler_dict["price"]
+        # Ambil hanya mean/scale dari kolom pertama jika scaler punya >1 kolom
+        if scaler.mean_.shape[0] > 1:
+            mean = scaler.mean_[0]
+            scale = scaler.scale_[0]
+            y_real = y_scaled * scale + mean
+        else:
+            y_real = scaler.inverse_transform(y_scaled)
     return y_real
 
 
@@ -69,7 +77,7 @@ def predict_next(prices_path: str, model_path: str, feature_subset: list, out_di
 
     # --- 5️⃣ Terapkan Kalman filter ---
     try:
-        y_smooth = apply_kalman_filter(y_pred_real)
+        y_smooth = apply_kalman_filter(pd.Series(y_pred_real))
         print("✨ Kalman smoothing berhasil diterapkan.")
     except Exception as e:
         print(f"⚠️ Gagal menerapkan Kalman filter: {e}")
