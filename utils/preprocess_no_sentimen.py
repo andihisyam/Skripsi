@@ -1,4 +1,3 @@
-# utils/preprocess_no_sentimen.py (versi revisi)
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
@@ -10,33 +9,30 @@ from config import (
     MA_PERIODS, EMA_PERIODS, RSI_PERIODS, MACD_CONFIGS
 )
 
-# ========================
-# 1. Load CSV
-# ========================
+# ================================================================
+# 1. LOAD CSV
+# ================================================================
 def load_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
-    df = df.dropna(subset=[DATE_COL]).sort_values(DATE_COL)
+    df = df.dropna(subset=[DATE_COL]).sort_values(DATE_COL).reset_index(drop=True)
     return df
 
 
-# ========================
-# 2. Tambahkan Return
-# ========================
+# ================================================================
+# 2. SIMPLE RETURN
+# ================================================================
 def add_simple_returns(df: pd.DataFrame) -> pd.DataFrame:
-    """Tambah kolom Return per Ticker agar skala lintas emiten comparable."""
     df = df.sort_values(["Ticker", DATE_COL])
     df["Return"] = df.groupby("Ticker")[TARGET_COL].pct_change()
     return df
 
 
-# ========================
-# 3. Ambil fitur numerik (tanpa target)
-# ========================
-def select_numeric_matrix(df: pd.DataFrame, target_col: str, feature_subset: Optional[List[str]] = None) -> Tuple[np.ndarray, List[str]]:
-    """
-    Ambil subset fitur numerik jadi matrix numpy.
-    """
+# ================================================================
+# 3. AMBIL FITUR NUMERIK
+# ================================================================
+def select_numeric_matrix(df: pd.DataFrame, target_col: str,
+                          feature_subset: Optional[List[str]] = None):
     drop_cols = [DATE_COL, target_col]
     num_df = df.drop(columns=drop_cols, errors="ignore").select_dtypes(include=[np.number])
 
@@ -47,100 +43,66 @@ def select_numeric_matrix(df: pd.DataFrame, target_col: str, feature_subset: Opt
     return num_df.values.astype(float), list(num_df.columns)
 
 
-# ========================
-# 4. Scaling (Standard untuk harga, Robust untuk Volume)
-# ========================
-def fit_scale(data: pd.DataFrame, scaler_dict: Optional[Dict[str, object]] = None, fit: bool = True):
-    """
-    Scaling hybrid:
-    - StandardScaler untuk fitur harga (Open, Close, High, Low dan lag-nya)
-    - RobustScaler untuk Volume
-    - MinMaxScaler fallback untuk indikator teknikal (RSI, MA, EMA, MACD, dll.)
-    """
+# ================================================================
+# 4. FIT HYBRID SCALER UNTUK FITUR
+# ================================================================
+def fit_scale(data: pd.DataFrame,
+              scaler_dict: Optional[Dict[str, object]] = None,
+              fit: bool = True):
 
     scaler_dict = scaler_dict or {}
     df_scaled = data.copy()
 
-    # =========================
-    # 🔍 DEBUG 1 — tampilkan semua kolom masuk
-    # =========================
-    print("\n[DEBUG] 🔍 Masuk ke fit_scale()")
-    print(f"[DEBUG] Kolom input data: {list(data.columns)}")
+    price_cols = [c for c in data.columns if any(k in c.lower() for k in ["open", "close", "high", "low"])]
+    volume_cols = [c for c in data.columns if "volume" in c.lower()]
+    indicator_cols = [c for c in data.columns if c not in price_cols + volume_cols]
 
-    # =========================
-    #  Inisialisasi scaler
-    # =========================
     if fit:
         scaler_dict["price"] = StandardScaler()
         scaler_dict["volume"] = RobustScaler()
         scaler_dict["indicator"] = MinMaxScaler()
 
-        # ✅ Gunakan deteksi substring biar lag ikut terbaca
-        price_cols = [c for c in data.columns if any(k in c.lower() for k in ["open", "close", "high", "low"])]
-        volume_cols = [c for c in data.columns if "volume" in c.lower()]
-        indicator_cols = [c for c in data.columns if c not in price_cols + volume_cols]
-
-        # =========================
-        # 🔍 DEBUG 2 — tampilkan grouping
-        # =========================
-        print(f"[DEBUG] Deteksi price_cols: {price_cols}")
-        print(f"[DEBUG] Deteksi volume_cols: {volume_cols}")
-        print(f"[DEBUG] Deteksi indicator_cols: {indicator_cols}")
-
-        # Fit tiap kelompok fitur
         if price_cols:
             df_scaled[price_cols] = scaler_dict["price"].fit_transform(data[price_cols])
-            print(f"[DEBUG] ✅ Scaler 'price' di-fit untuk {len(price_cols)} kolom.")
-        else:
-            print("[DEBUG] ⚠️ Tidak ada kolom harga terdeteksi untuk scaler 'price'.")
-
         if volume_cols:
             df_scaled[volume_cols] = scaler_dict["volume"].fit_transform(data[volume_cols])
-            print(f"[DEBUG] ✅ Scaler 'volume' di-fit untuk {len(volume_cols)} kolom.")
-        else:
-            print("[DEBUG] ⚠️ Tidak ada kolom volume terdeteksi untuk scaler 'volume'.")
-
         if indicator_cols:
             df_scaled[indicator_cols] = scaler_dict["indicator"].fit_transform(data[indicator_cols])
-            print(f"[DEBUG] ✅ Scaler 'indicator' di-fit untuk {len(indicator_cols)} kolom.")
-        else:
-            print("[DEBUG] ⚠️ Tidak ada kolom indikator terdeteksi untuk scaler 'indicator'.")
 
     else:
-        # =========================
-        # Transform pakai scaler lama
-        # =========================
-        price_cols = [c for c in data.columns if any(k in c.lower() for k in ["open", "close", "high", "low"])]
-        volume_cols = [c for c in data.columns if "volume" in c.lower()]
-        indicator_cols = [c for c in data.columns if c not in price_cols + volume_cols]
-
-        print(f"[DEBUG] (Transform mode) price_cols: {price_cols}")
-        print(f"[DEBUG] (Transform mode) volume_cols: {volume_cols}")
-        print(f"[DEBUG] (Transform mode) indicator_cols: {indicator_cols}")
-
         if "price" in scaler_dict and price_cols:
             df_scaled[price_cols] = scaler_dict["price"].transform(data[price_cols])
-        else:
-            print("[DEBUG] ⚠️ Skip transform price — tidak ada kolom atau scaler belum di-fit.")
-
         if "volume" in scaler_dict and volume_cols:
             df_scaled[volume_cols] = scaler_dict["volume"].transform(data[volume_cols])
-        else:
-            print("[DEBUG] ⚠️ Skip transform volume — tidak ada kolom atau scaler belum di-fit.")
-
         if "indicator" in scaler_dict and indicator_cols:
             df_scaled[indicator_cols] = scaler_dict["indicator"].transform(data[indicator_cols])
-        else:
-            print("[DEBUG] ⚠️ Skip transform indicator — tidak ada kolom atau scaler belum di-fit.")
-
-    print(f"[DEBUG] ✅ Total kolom output setelah scaling: {len(df_scaled.columns)}")
-    print("[DEBUG] ✅ Selesai fit_scale()\n")
 
     return df_scaled, scaler_dict
 
-# ========================
-# 5. Siapkan sequence (windowing)
-# ========================
+
+# ================================================================
+# 5. SCALE TARGET CLOSE
+# ================================================================
+def scale_target(y: np.ndarray,
+                 scaler_dict: dict,
+                 fit: bool):
+
+    if fit:
+        scaler = StandardScaler()
+        y_scaled = scaler.fit_transform(y.reshape(-1, 1)).flatten()
+        scaler_dict["target_close"] = scaler
+        return y_scaled, scaler_dict
+
+    else:
+        scaler = scaler_dict["target_close"]
+        y_scaled = scaler.transform(y.reshape(-1, 1)).flatten()
+        return y_scaled, scaler_dict
+    
+
+
+# ================================================================
+# 6. WINDOWING (X, Y)
+# ================================================================
 def prepare_sequences(
     df: pd.DataFrame,
     target_col_name: str,
@@ -149,56 +111,51 @@ def prepare_sequences(
     scaler_dict: Optional[Dict[str, object]] = None,
     step_size: int = 1,
 ):
-    print(f"\n[DEBUG] Mulai prepare_sequences target={target_col_name}, horizon={horizon}, fitur={feature_subset}")
 
-    # ambil input (pakai subset kalau ada)
+    # 1. Ambil fitur numerik
     data_num, cols = select_numeric_matrix(df, target_col=target_col_name, feature_subset=feature_subset)
     data_df = pd.DataFrame(data_num, columns=cols)
 
-    # scaling
+    # 2. Scaling fitur
     fit_mode = scaler_dict is None
     data_scaled_df, scaler_dict = fit_scale(data_df, scaler_dict, fit=fit_mode)
-
     data_scaled = data_scaled_df.values
+
+    # 3. TARGET asli & scaling target
     tgt = df[target_col_name].values
+    tgt_scaled, scaler_dict = scale_target(tgt, scaler_dict, fit=fit_mode)
 
     T, F = data_scaled.shape
     needed = N_STEPS + horizon
     if T < needed:
         raise ValueError(f"Data terlalu pendek. Perlu ≥ {needed}, ada {T}")
 
-    # buat window X
+    # 4. Buat window X
     X_full = sliding_window_view(data_scaled, (N_STEPS, F))[:, 0, :, :]
 
-    # buat y (horizon)
+    # 5. Buat window Y (scaled)
     y_list = []
     max_start = T - (N_STEPS + horizon) + 1
     for s in range(0, max_start, step_size):
-        y_list.append(tgt[s + N_STEPS : s + N_STEPS + horizon])
+        y_list.append(tgt_scaled[s + N_STEPS : s + N_STEPS + horizon])
+
     X = X_full[:max_start:step_size]
     y = np.stack(y_list, axis=0)
 
-    print(f"[DEBUG] Final X shape: {X.shape}, y shape: {y.shape}")
     return X, y, scaler_dict, cols
 
 
-# ========================
-# 6. Split data (train/val/test)
-# ========================
+# ================================================================
+# 7. SPLIT (Hybrid)
+# ================================================================
 def time_split_hybrid(df: pd.DataFrame,
                       train_end: str, val_end: str,
                       start_date_expected="2015-03-02",
                       train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO,
-                      min_needed: int = None):
-    """
-    Hybrid split:
-    - Jika data dimulai tepat dari start_date_expected → pakai split tanggal.
-    - Jika tidak → pakai split proporsi.
-    - Jika hasil split terlalu pendek → fallback ke proporsi.
-    """
+                      min_needed=None):
+
     df = df.sort_values(DATE_COL).reset_index(drop=True)
     start_actual = df[DATE_COL].min().date()
-    print(f"\n[DEBUG] Mulai time_split_hybrid, start_actual={start_actual}, rows={len(df)}")
 
     if min_needed is None:
         min_needed = N_STEPS + H_1M
@@ -217,13 +174,12 @@ def time_split_hybrid(df: pd.DataFrame,
         te = df.iloc[n_train+n_val:]
         mode = "ratio"
 
-    print(f"[DEBUG] Split mode={mode}, train={len(tr)}, val={len(va)}, test={len(te)}")
     return tr, va, te, mode
 
 
-# ========================
-# 7. Indikator teknikal (MA, EMA, RSI, MACD + lag)
-# ========================
+# ================================================================
+# 8. INDIKATOR TEKNIKAL
+# ================================================================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -249,9 +205,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         ema_slow = df[TARGET_COL].ewm(span=slow, adjust=False).mean()
         df[f"MACD_{fast}_{slow}"] = ema_fast - ema_slow
 
-    # Lag fitur
+    # LAG close
     for lag in range(1, 4):
         df[f"{TARGET_COL}_lag{lag}"] = df[TARGET_COL].shift(lag)
 
-    df = df.dropna().reset_index(drop=True)
-    return df
+    return df.dropna().reset_index(drop=True)

@@ -1,13 +1,13 @@
 # utils/train_no_sentimen.py
-
 import os
 from pathlib import Path
+from typing import Tuple
 from datetime import date
-from typing import Optional, Sequence, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
-import torch
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import joblib
 
 from sklearn.metrics import (
@@ -15,8 +15,11 @@ from sklearn.metrics import (
     r2_score,
     root_mean_squared_error,
 )
-
 from sklearn.model_selection import TimeSeriesSplit
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 from utils.io_utils import load_prices_from_folder
 from utils.preprocess_no_sentimen import (
@@ -25,22 +28,31 @@ from utils.preprocess_no_sentimen import (
     prepare_sequences,
 )
 from utils.summarize import summarize_training_results_advanced
-from utils.optuna_objective import run_optuna_for_fold
 
 from config import DATE_COL, TARGET_COL, N_STEPS, H_1M, TRAIN_END, VAL_END
 
 
 # ======================================================
-# ⚙ Hyperparameter Tuning Config (Optuna)
+# 🔧 Hyperparameter Candidates
 # ======================================================
-N_TRIALS_OPTUNA = 30   # jumlah trial Optuna 
-MAX_EPOCHS = 100        # Balanced mode
+DENSE_CANDIDATES = [32, 64, 128, 256]
 
 
 # ======================================================
-# 1️⃣ Kombinasi fitur (tetap seperti versi awal)
+# 📌 RMSE Loss Function 
 # ======================================================
-FEATURE_COMBINATIONS: Dict[str, Sequence[str]] = {
+class RMSELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, yhat, y):
+        return torch.sqrt(self.mse(yhat, y))
+
+# ======================================================
+# 1️⃣ Kombinasi fitur (tetap sama seperti versi Keras)
+# ======================================================
+FEATURE_COMBINATIONS = {
     # Single (selalu + lag dari Close)
     "Open_LAG": ["Open", "Close_lag1", "Close_lag2", "Close_lag3"],
     "High_LAG": ["High", "Close_lag1", "Close_lag2", "Close_lag3"],
@@ -161,18 +173,13 @@ FEATURE_COMBINATIONS: Dict[str, Sequence[str]] = {
         "EMA5", "EMA12", "EMA26", "EMA30", "EMA50",
         "RSI7", "RSI14", "RSI21",
         "MACD_5_20", "MACD_10_30", "MACD_12_26"
-    ],
+    ]
 }
 
-
 # ======================================================
-# 📌 Penentuan Test Size (dynamic)
+# 📌 Penentuan Test Size (same logic)
 # ======================================================
-def determine_test_size(df: pd.DataFrame) -> Tuple[int, str]:
-    """
-    Menentukan ukuran test set yang adaptif berdasarkan panjang data
-    dan tanggal mulai (khusus dataset mulai 2015-03-02).
-    """
+def determine_test_size(df: pd.DataFrame):
     START_DATE_EXPECTED = date(2015, 3, 2)
     MIN_NEEDED = N_STEPS + H_1M
 
@@ -190,42 +197,138 @@ def determine_test_size(df: pd.DataFrame) -> Tuple[int, str]:
 
 
 # ======================================================
-# 📌 Training Utama dengan Optuna
+# 📌 Model LSTM base
 # ======================================================
-def train_each(
-    data_dir: str = "../Data/Saham",
-    out_dir: str = "models",
-    tickers_filter: Optional[Sequence[str]] = None,
-    subset_filter: Optional[Sequence[str]] = None,
-):
-    """
-    Training LSTM per emiten dan per subset fitur dengan:
-    - TimeSeriesSplit (CV)
-    - Hyperparameter tuning menggunakan Optuna
-    - Penyimpanan model terbaik per emiten + log hasil ke CSV & Excel
-    """
+class LSTMRegressor(nn.Module):
+    def __init__(self, input_dim, hidden_dim, dense_units, output_dim):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(0.2)
+        self.fc1 = nn.Linear(hidden_dim, dense_units)
+        self.relu = nn.ReLU()
+        self.fc_out = nn.Linear(dense_units, output_dim)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        out = self.dropout(out)
+        out = self.fc1(out)
+        out = self.relu(out)
+        out = self.fc_out(out)
+        return out
+
+
+# ======================================================
+# 📌 Build LSTM Model 
+# ======================================================
+def build_lstm_model(input_shape, dense_units):
+    num_features = input_shape[-1]
+    hidden_units = 64 if num_features < 10 else 128
+    return LSTMRegressor(num_features, hidden_units, dense_units, H_1M)
+
+
+# ======================================================
+# 📌 Train 1 Fold (RMSE + logging)
+# ======================================================
+def train_one_fold(model, Xtr, ytr, Xva, yva, device,
+                   num_epochs=100, batch_size=32,
+                   dense_units=None, fold=None, ticker=None):
+
+    print(f"      ▶ [DENSE {dense_units}] Training dimulai...")
+
+    model = model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    criterion = RMSELoss()
+
+    Xtr_t = torch.tensor(Xtr, dtype=torch.float32).to(device)
+    ytr_t = torch.tensor(ytr, dtype=torch.float32).to(device)
+    Xva_t = torch.tensor(Xva, dtype=torch.float32).to(device)
+    yva_t = torch.tensor(yva, dtype=torch.float32).to(device)
+
+    n_train = Xtr_t.size(0)
+
+    train_losses, val_losses, val_maes = [], [], []
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_pred = None
+
+    for epoch in range(num_epochs):
+
+        # TRAIN
+        model.train()
+        perm = torch.randperm(n_train)
+        epoch_loss = 0.0
+
+        for i in range(0, n_train, batch_size):
+            idx = perm[i:i+batch_size]
+            batch_X = Xtr_t[idx]
+            batch_y = ytr_t[idx]
+
+            optimizer.zero_grad()
+            pred = model(batch_X)
+            loss = criterion(pred, batch_y)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item() * batch_X.size(0)
+
+        epoch_loss /= n_train
+        train_losses.append(epoch_loss)
+
+        # VALIDATION
+        model.eval()
+        with torch.no_grad():
+            pred_va = model(Xva_t)
+            vloss = criterion(pred_va, yva_t).item()
+            val_losses.append(vloss)
+
+            mae = torch.mean(torch.abs(pred_va - yva_t)).item()
+            val_maes.append(mae)
+
+            if vloss < best_val_loss:
+                best_val_loss = vloss
+                best_epoch = epoch
+                best_pred = pred_va.detach().cpu().numpy()
+
+        # LOG PER 10 EPOCH
+        if (epoch + 1) % 10 == 0:
+            print(
+                f"        [Fold {fold}] [Dense {dense_units}] "
+                f"Epoch {epoch+1}/100 | Train={epoch_loss:.6f} | Val={vloss:.6f}"
+            )
+
+    print(f"      ✔ [DENSE {dense_units}] selesai — Best Loss={best_val_loss:.6f} di Epoch {best_epoch+1}")
+    return train_losses, val_losses, val_maes, best_epoch, best_pred
+
+
+# ======================================================
+# 📌 Training Utama
+# ======================================================
+def train_each(data_dir="../Data/Saham", out_dir="models",
+               tickers_filter=None, subset_filter=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[DEVICE] {device}")
 
-    data_path = Path(data_dir)
-    data_path.mkdir(parents=True, exist_ok=True)
+    DATA_DIR = Path(data_dir)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load & preprocessing global
-    prices = load_prices_from_folder(str(data_path))
+    prices = load_prices_from_folder(str(DATA_DIR))
     prices = add_simple_returns(prices)
     prices = add_indicators(prices)
 
-    tickers_all = prices["Ticker"].unique()
+    tickers = prices["Ticker"].unique()
     if tickers_filter:
-        tickers = [t for t in tickers_all if t in tickers_filter]
-    else:
-        tickers = list(tickers_all)
+        tickers = [t for t in tickers if t in tickers_filter]
 
     print(f"[INFO] Emiten terbaca: {tickers}")
 
     os.makedirs(out_dir, exist_ok=True)
-
     logs = []
 
     # ======================================================
@@ -239,6 +342,9 @@ def train_each(
         print(f"[START] Training subset fitur: {comb_name}")
         print("==============================================")
 
+        pdf_path = os.path.join(out_dir, f"loss_curves_{comb_name}.pdf")
+        pdf = PdfPages(pdf_path)
+
         # LOOP TICKER
         for t in tickers:
             print("\n----------------------------------------------")
@@ -248,18 +354,12 @@ def train_each(
             df_t = prices[prices["Ticker"] == t].copy()
             df_t = df_t.dropna(subset=[TARGET_COL])
 
-            if df_t.empty:
-                print(f"  ⚠ Data untuk {t} kosong setelah dropna {TARGET_COL}. Skip.")
-                continue
-
             test_size, split_mode = determine_test_size(df_t)
-            print(f"  ▶ Split mode: {split_mode}, test_size={test_size}")
-
             tscv = TimeSeriesSplit(n_splits=5, test_size=test_size)
 
-            best_model_state_global = None
+            best_model_state = None
             best_val_loss_global = float("inf")
-            best_scaler_dict_global = None
+            best_scaler_dict = None
 
             # LOOP FOLD
             for fold, (tr_idx, va_idx) in enumerate(tscv.split(df_t)):
@@ -269,119 +369,99 @@ def train_each(
                 va = df_t.iloc[va_idx]
 
                 try:
-                    Xtr, ytr, scaler_dict, _ = prepare_sequences(
-                        tr, TARGET_COL, H_1M, fitur
-                    )
-                    Xva, yva, _, _ = prepare_sequences(
-                        va, TARGET_COL, H_1M, fitur, scaler_dict=scaler_dict
-                    )
+                    Xtr, ytr, scaler_dict, _ = prepare_sequences(tr, TARGET_COL, H_1M, fitur)
+                    Xva, yva, _, _ = prepare_sequences(va, TARGET_COL, H_1M, fitur, scaler_dict=scaler_dict)
                 except Exception as e:
-                    print(f"  ⚠ SKIP Fold {fold+1} ({t}, {comb_name}): {e}")
+                    print(f"  ⚠ SKIP Fold {fold+1}: {e}")
                     continue
 
-                if Xtr.shape[0] < 10 or Xva.shape[0] < 5:
-                    print(f"  ⚠ SKIP Fold {fold+1}: data sequence terlalu sedikit.")
-                    continue
+                fold_best_loss = float("inf")
+                fold_best_dense = None
+                fold_best_pred = None
+                fold_best_epoch = None
+                fold_best_state = None
 
-                input_shape = (N_STEPS, Xtr.shape[-1])
+                # ======================================================
+                # DENSE UNITS TUNING
+                # ======================================================
+                for dense_units in DENSE_CANDIDATES:
+                    model = build_lstm_model((N_STEPS, Xtr.shape[-1]), dense_units)
 
-                # ==============================================
-                # 🔍 Optuna tuning untuk 1 fold
-                # ==============================================
-                print("    ▶ Optuna tuning hyperparameter...")
-                best_result = run_optuna_for_fold(
-                    input_shape=input_shape,
-                    Xtr=Xtr,
-                    ytr=ytr,
-                    Xva=Xva,
-                    yva=yva,
-                    device=device,
-                    H_output=H_1M,
-                    trials=N_TRIALS_OPTUNA,
-                    MAX_EPOCHS=MAX_EPOCHS,
-                )
+                    (
+                        train_losses,
+                        val_losses,
+                        val_maes,
+                        best_epoch,
+                        yva_pred_best,
+                    ) = train_one_fold(
+                        model, Xtr, ytr, Xva, yva, device=device,
+                        dense_units=dense_units, fold=fold+1, ticker=t
+                    )
 
-                fold_best_loss = float(best_result["loss"])
-                fold_best_epoch = int(best_result["epoch"])
-                fold_best_pred = best_result["pred"]
-                fold_best_params = best_result["params"]
-                fold_best_state = best_result.get("state_dict", None)
+                    vloss_best = val_losses[best_epoch]
+                    mae_best = val_maes[best_epoch]
 
-                print(
-                    f"    ✔ Fold {fold+1} selesai — "
-                    f"Loss terbaik={fold_best_loss:.6f} di Epoch {fold_best_epoch+1}"
-                )
-                print(f"      Param terbaik: {fold_best_params}")
-
-                # ==============================================
-                # 🔢 Hitung metrik evaluasi per fold
-                # ==============================================
-                y_true = yva.reshape(-1)
-                y_pred = np.array(fold_best_pred).reshape(-1)
-
-                val_rmse = root_mean_squared_error(y_true, y_pred)
-                val_mape = mean_absolute_percentage_error(y_true, y_pred)
-                val_r2 = r2_score(y_true, y_pred)
-                val_mae = float(np.mean(np.abs(y_true - y_pred)))
-                val_loss = float(fold_best_loss)  # sama dengan RMSELoss terbaik
-
-                logs.append(
-                    {
+                    if vloss_best < fold_best_loss:
+                        fold_best_loss = vloss_best
+                        fold_best_dense = dense_units
+                        fold_best_pred = yva_pred_best
+                        fold_best_epoch = best_epoch
+                        fold_best_state = model.state_dict()
+                    # =============================
+                    # LOG SEMUA DENSE UNITS
+                    # =============================
+                    logs.append({
                         "Ticker": t,
                         "Fitur": comb_name,
-                        "Fold": fold + 1,
-                        "Dense_Units": int(fold_best_params["dense_units"]),
-                        "Hidden_Units": int(fold_best_params["hidden_units"]),
-                        "Dropout": float(fold_best_params["dropout"]),
-                        "LR": float(fold_best_params["lr"]),
-                        "Batch_Size": int(fold_best_params["batch_size"]),
-                        "Optimizer": str(fold_best_params["optimizer"]),
-                        "Best_Epoch": fold_best_epoch + 1,
-                        "Val_Loss": val_loss,
-                        "Val_MAE": val_mae,
-                        "Val_MAPE": float(val_mape),
-                        "Val_RMSE": float(val_rmse),
-                        "Val_R2": float(val_r2),
-                    }
-                )
+                        "Fold": fold+1,
+                        "Dense_Units": dense_units,
+                        "Best_Epoch": best_epoch+1,
+                        "Val_Loss": float(vloss_best),
+                        "Val_MAE": float(mae_best),
+                        "Val_RMSE": float(root_mean_squared_error(yva, yva_pred_best)),
+                        "Val_MAPE": float(mean_absolute_percentage_error(yva, yva_pred_best)),
+                        "Val_R2": float(r2_score(yva, yva_pred_best)),
+})
 
-                # Simpan model terbaik global per ticker & fitur
-                if fold_best_state is not None and fold_best_loss < best_val_loss_global:
+                print(f"  ✔ Fold {fold+1} selesai — Dense terbaik={fold_best_dense}, Loss={fold_best_loss:.6f}")
+
+                plt.figure()
+                plt.plot(train_losses, label="Train")
+                plt.plot(val_losses, label="Val")
+                plt.axvline(fold_best_epoch, linestyle="--", color="red", label="Best")
+                plt.title(f"{t} - {comb_name} Fold {fold+1} | Dense={fold_best_dense}")
+                plt.legend()
+                pdf.savefig()
+                plt.close()
+
+                if fold_best_loss < best_val_loss_global:
                     best_val_loss_global = fold_best_loss
-                    best_model_state_global = fold_best_state
-                    best_scaler_dict_global = scaler_dict
+                    best_model_state = fold_best_state
+                    best_scaler_dict = scaler_dict
 
-            # Save model terbaik per ticker & subset fitur
-            if best_model_state_global is not None:
+            # Save model terbaik per ticker
+            if best_model_state is not None:
                 save_dir = os.path.join(out_dir, comb_name)
                 os.makedirs(save_dir, exist_ok=True)
 
                 model_path = os.path.join(save_dir, f"{t}_best_price.pt")
                 scaler_path = os.path.join(save_dir, f"{t}_scaler.pkl")
 
-                torch.save(best_model_state_global, model_path)
-                joblib.dump(best_scaler_dict_global, scaler_path)
+                torch.save(best_model_state, model_path)
+                joblib.dump(best_scaler_dict, scaler_path)
 
                 print(f"\n  💾 [SAVED] Model terbaik untuk {t}: {model_path}")
-            else:
-                print(f"\n  ⚠ Tidak ada model valid yang disimpan untuk {t} ({comb_name}).")
 
-    # ======================================================
-    # Simpan log seluruh training ke CSV + Excel summary
-    # ======================================================
+        pdf.close()
+
     summary_path = os.path.join(out_dir, "training_summary.csv")
     pd.DataFrame(logs).to_csv(summary_path, index=False)
 
     try:
         summarize_training_results_advanced(
             summary_path,
-            os.path.join(out_dir, "training_results_complete.xlsx"),
+            os.path.join(out_dir, "training_results_with_epoch.xlsx"),
         )
-        print("\n[LOG] Excel summary lengkap dibuat.")
+        print("\n[LOG] Excel summary dibuat.")
     except Exception as e:
-        print("[WARN] Gagal membuat summary Excel:", e)
-
-
-if __name__ == "__main__":
-    # Contoh pemanggilan default
-    train_each()
+        print("[WARN] Gagal membuat summary Excel.",e)

@@ -60,7 +60,7 @@ def run_mpc(r_pred, tickers, lambda_return=1.0):
     f = B.T @ Q @ (A @ xk - r_pred)
     u = cp.Variable((n, 1))
 
-    # 🔥 Fungsi objektif baru: penalti stabilitas + preferensi return
+    #Fungsi objektif baru: penalti stabilitas + preferensi return
     objective = cp.Minimize(cp.quad_form(u, H) + 2 * f.T @ u - lambda_return * (r_pred.T @ u))
 
     constraints = [
