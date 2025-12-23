@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from datetime import date
 from typing import Optional, Sequence, Tuple, Dict, Any
+import logging
 
 import numpy as np
 import pandas as pd
@@ -24,10 +25,12 @@ from utils.preprocess_no_sentimen import (
     add_indicators,
     prepare_sequences,
 )
+from utils.model_utils import build_lstm_model
 from utils.summarize import summarize_training_results_advanced
 from utils.optuna_objective import run_optuna_for_fold
 
 from config import DATE_COL, TARGET_COL, N_STEPS, H_1M, TRAIN_END, VAL_END
+from sklearn.model_selection import GridSearchCV
 
 
 # ======================================================
@@ -36,6 +39,22 @@ from config import DATE_COL, TARGET_COL, N_STEPS, H_1M, TRAIN_END, VAL_END
 N_TRIALS_OPTUNA = 30   # jumlah trial Optuna 
 MAX_EPOCHS = 100        # Balanced mode
 
+# Parameter GridSearch
+param_grid = {
+    'dense_units': [32, 64, 128],
+    'hidden_units': [32, 64, 128],
+    'dropout': [0.1, 0.3, 0.5],
+    'lr': [1e-4, 1e-3, 1e-2],
+    'batch_size': [16, 32],
+    'optimizer': ['Adam', 'AdamW']
+}
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(message)s',
+    level=logging.INFO,
+    handlers=[logging.StreamHandler()]
+)
 
 # ======================================================
 # 1️⃣ Kombinasi fitur (tetap seperti versi awal)
@@ -164,6 +183,15 @@ FEATURE_COMBINATIONS: Dict[str, Sequence[str]] = {
     ],
 }
 
+# Grid Search Function
+def run_grid_search_for_fold(Xtr, ytr):
+    model = build_lstm_model(input_shape=Xtr.shape, dense_units=64, hidden_units=128, dropout=0.3, output_dim=H_1M)
+    
+    # Setup GridSearchCV untuk LSTM model
+    grid_search = GridSearchCV(estimator=model, param_grid=param_grid, cv=3, scoring='neg_mean_squared_error')
+    grid_search.fit(Xtr, ytr)
+    return grid_search.best_params_
+
 
 # ======================================================
 # 📌 Penentuan Test Size (dynamic)
@@ -201,12 +229,12 @@ def train_each(
     """
     Training LSTM per emiten dan per subset fitur dengan:
     - TimeSeriesSplit (CV)
-    - Hyperparameter tuning menggunakan Optuna
+    - Hyperparameter tuning menggunakan Optuna dan Grid Search
     - Penyimpanan model terbaik per emiten + log hasil ke CSV & Excel
     """
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[DEVICE] {device}")
+    logging.info(f"[DEVICE] {device}")
 
     data_path = Path(data_dir)
     data_path.mkdir(parents=True, exist_ok=True)
@@ -222,7 +250,7 @@ def train_each(
     else:
         tickers = list(tickers_all)
 
-    print(f"[INFO] Emiten terbaca: {tickers}")
+    logging.info(f"[INFO] Emiten terbaca: {tickers}")
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -235,25 +263,25 @@ def train_each(
         if subset_filter and comb_name not in subset_filter:
             continue
 
-        print("\n==============================================")
-        print(f"[START] Training subset fitur: {comb_name}")
-        print("==============================================")
+        logging.info(f"\n==============================================")
+        logging.info(f"[START] Training subset fitur: {comb_name}")
+        logging.info(f"==============================================")
 
         # LOOP TICKER
         for t in tickers:
-            print("\n----------------------------------------------")
-            print(f"[TICKER] Mulai training untuk: {t}")
-            print("----------------------------------------------")
+            logging.info(f"\n----------------------------------------------")
+            logging.info(f"[TICKER] Mulai training untuk: {t}")
+            logging.info(f"----------------------------------------------")
 
             df_t = prices[prices["Ticker"] == t].copy()
             df_t = df_t.dropna(subset=[TARGET_COL])
 
             if df_t.empty:
-                print(f"  ⚠ Data untuk {t} kosong setelah dropna {TARGET_COL}. Skip.")
+                logging.warning(f"  ⚠ Data untuk {t} kosong setelah dropna {TARGET_COL}. Skip.")
                 continue
 
             test_size, split_mode = determine_test_size(df_t)
-            print(f"  ▶ Split mode: {split_mode}, test_size={test_size}")
+            logging.info(f"  ▶ Split mode: {split_mode}, test_size={test_size}")
 
             tscv = TimeSeriesSplit(n_splits=5, test_size=test_size)
 
@@ -263,7 +291,7 @@ def train_each(
 
             # LOOP FOLD
             for fold, (tr_idx, va_idx) in enumerate(tscv.split(df_t)):
-                print(f"\n  ▶ [Fold {fold+1}/5] Train={len(tr_idx)}, Val={len(va_idx)}")
+                logging.info(f"\n  ▶ [Fold {fold+1}/5] Train={len(tr_idx)}, Val={len(va_idx)}")
 
                 tr = df_t.iloc[tr_idx]
                 va = df_t.iloc[va_idx]
@@ -276,11 +304,11 @@ def train_each(
                         va, TARGET_COL, H_1M, fitur, scaler_dict=scaler_dict
                     )
                 except Exception as e:
-                    print(f"  ⚠ SKIP Fold {fold+1} ({t}, {comb_name}): {e}")
+                    logging.warning(f"  ⚠ SKIP Fold {fold+1} ({t}, {comb_name}): {e}")
                     continue
 
                 if Xtr.shape[0] < 10 or Xva.shape[0] < 5:
-                    print(f"  ⚠ SKIP Fold {fold+1}: data sequence terlalu sedikit.")
+                    logging.warning(f"  ⚠ SKIP Fold {fold+1}: data sequence terlalu sedikit.")
                     continue
 
                 input_shape = (N_STEPS, Xtr.shape[-1])
@@ -288,7 +316,7 @@ def train_each(
                 # ==============================================
                 # 🔍 Optuna tuning untuk 1 fold
                 # ==============================================
-                print("    ▶ Optuna tuning hyperparameter...")
+                logging.info(f"    ▶ Mulai tuning dengan Optuna untuk Fold {fold+1}...")
                 best_result = run_optuna_for_fold(
                     input_shape=input_shape,
                     Xtr=Xtr,
@@ -307,11 +335,16 @@ def train_each(
                 fold_best_params = best_result["params"]
                 fold_best_state = best_result.get("state_dict", None)
 
-                print(
-                    f"    ✔ Fold {fold+1} selesai — "
-                    f"Loss terbaik={fold_best_loss:.6f} di Epoch {fold_best_epoch+1}"
-                )
-                print(f"      Param terbaik: {fold_best_params}")
+                logging.info(f"    ✔ Fold {fold+1} selesai — Loss terbaik={fold_best_loss:.6f} di Epoch {fold_best_epoch+1}")
+                logging.info(f"      Param terbaik: {fold_best_params}")
+
+                # ==============================================
+                # 🔍 Grid Search tuning untuk 1 fold
+                # ==============================================
+                logging.info(f"    ▶ Mulai tuning dengan Grid Search untuk Fold {fold+1}...")
+                best_params_grid_search = run_grid_search_for_fold(Xtr, ytr)
+
+                logging.info(f"    ✔ Grid Search result: {best_params_grid_search}")
 
                 # ==============================================
                 # 🔢 Hitung metrik evaluasi per fold
@@ -362,9 +395,9 @@ def train_each(
                 torch.save(best_model_state_global, model_path)
                 joblib.dump(best_scaler_dict_global, scaler_path)
 
-                print(f"\n  💾 [SAVED] Model terbaik untuk {t}: {model_path}")
+                logging.info(f"\n  💾 [SAVED] Model terbaik untuk {t}: {model_path}")
             else:
-                print(f"\n  ⚠ Tidak ada model valid yang disimpan untuk {t} ({comb_name}).")
+                logging.warning(f"\n  ⚠ Tidak ada model valid yang disimpan untuk {t} ({comb_name}).")
 
     # ======================================================
     # Simpan log seluruh training ke CSV + Excel summary
@@ -377,11 +410,6 @@ def train_each(
             summary_path,
             os.path.join(out_dir, "training_results_complete.xlsx"),
         )
-        print("\n[LOG] Excel summary lengkap dibuat.")
+        logging.info("\n[LOG] Excel summary lengkap dibuat.")
     except Exception as e:
-        print("[WARN] Gagal membuat summary Excel:", e)
-
-
-if __name__ == "__main__":
-    # Contoh pemanggilan default
-    train_each()
+        logging.warning("[WARN] Gagal membuat summary Excel:", e)
