@@ -2,6 +2,7 @@ import optuna
 from optuna.pruners import MedianPruner
 import torch
 
+
 from sklearn.metrics import (
     mean_absolute_percentage_error,
     r2_score,
@@ -12,25 +13,27 @@ from utils.model_utils import build_lstm_model
 from utils.model_utils import build_optimizer
 from utils.model_utils import RMSELoss
 
-
 def train_one_fold_optuna(
     trial,
-    input_shape,
     Xtr,
     ytr,
     Xva,
     yva,
     device,
+    input_shape,
     H_output=1,
     MAX_EPOCHS=80
 ):
+    # Print dimensi data sebelum dimasukkan ke model
+    print(f"Dimensi data training (Xtr): {Xtr.shape}")
+    print(f"Dimensi data validation (Xva): {Xva.shape}")
+    
     # ====================
     # Hyperparameter search
     # ====================
     dense_units = trial.suggest_int("dense_units", 32, 256, step=32)
     hidden_units = trial.suggest_int("hidden_units", 32, 256, step=32)
     dropout = trial.suggest_float("dropout", 0.1, 0.5)
-
     lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
     batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
     optimizer_name = trial.suggest_categorical(
@@ -41,7 +44,7 @@ def train_one_fold_optuna(
     # Build model
     # ====================
     model = build_lstm_model(
-        input_shape=input_shape,
+        Xtr,
         dense_units=dense_units,
         hidden_units=hidden_units,
         dropout=dropout,
@@ -57,12 +60,16 @@ def train_one_fold_optuna(
     Xva_t = torch.tensor(Xva, dtype=torch.float32).to(device)
     yva_t = torch.tensor(yva, dtype=torch.float32).to(device)
 
+    # Print dimensi data sebelum dilatih
+    print(f"Dimensi data training: {Xtr_t.shape}")
+    print(f"Dimensi data validation: {Xva_t.shape}")
+
     n_train = Xtr_t.size(0)
 
     best_val_loss = float("inf")
     best_pred = None
     best_epoch = 0
-    best_state = None   # <<--- PENTING: simpan state_dict
+    best_state = None
 
     # ====================
     # Training loop
@@ -91,14 +98,17 @@ def train_one_fold_optuna(
                 best_val_loss = vloss
                 best_pred = pred_va.detach().cpu().numpy()
                 best_epoch = epoch
-                best_state = model.state_dict()  # <<--- SIMPAN MODEL
+                best_state = model.state_dict()  # Save model
 
         # pruning signal
         trial.report(best_val_loss, epoch)
         if trial.should_prune():
             raise optuna.TrialPruned()
 
-    # Return metrics for logging outside
+    # Pastikan y dan output memiliki dimensi yang sama
+    if best_pred is not None and len(best_pred.shape) != len(yva.shape):
+        best_pred = best_pred.reshape(-1, 1)  # Reshape jika perlu
+
     return {
         "loss": best_val_loss,
         "pred": best_pred,
@@ -111,7 +121,7 @@ def train_one_fold_optuna(
             "batch_size": batch_size,
             "optimizer": optimizer_name,
         },
-        "state_dict": best_state,     # <<--- KEMBALIKAN KEATAS
+        "state_dict": best_state,  # Return state_dict
     }
 
 

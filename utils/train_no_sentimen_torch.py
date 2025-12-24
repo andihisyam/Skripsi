@@ -32,10 +32,6 @@ from utils.summarize import summarize_training_results_advanced
 from config import DATE_COL, TARGET_COL, N_STEPS, H_1M, TRAIN_END, VAL_END
 
 
-# ======================================================
-# 🔧 Hyperparameter Candidates
-# ======================================================
-DENSE_CANDIDATES = [32, 64, 128, 256]
 
 
 # ======================================================
@@ -200,7 +196,7 @@ def determine_test_size(df: pd.DataFrame):
 # 📌 Model LSTM base
 # ======================================================
 class LSTMRegressor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, dense_units, output_dim):
+    def __init__(self, input_dim, hidden_dim, dense_units, output_dim, dropout=0.2):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -208,7 +204,7 @@ class LSTMRegressor(nn.Module):
             num_layers=1,
             batch_first=True,
         )
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(dropout)
         self.fc1 = nn.Linear(hidden_dim, dense_units)
         self.relu = nn.ReLU()
         self.fc_out = nn.Linear(dense_units, output_dim)
@@ -222,27 +218,53 @@ class LSTMRegressor(nn.Module):
         out = self.fc_out(out)
         return out
 
-
 # ======================================================
 # 📌 Build LSTM Model 
 # ======================================================
-def build_lstm_model(input_shape, dense_units):
+def build_lstm_model(input_shape, hidden_units, dense_units, dropout, output_dim):
     num_features = input_shape[-1]
-    hidden_units = 64 if num_features < 10 else 128
-    return LSTMRegressor(num_features, hidden_units, dense_units, H_1M)
+    return LSTMRegressor(
+        input_dim=num_features,
+        hidden_dim=hidden_units,
+        dense_units=dense_units,
+        output_dim=output_dim,
+        dropout=dropout,  # pastikan LSTMRegressor menerima dropout (lihat catatan di bawah)
+    )
 
 
 # ======================================================
 # 📌 Train 1 Fold (RMSE + logging)
 # ======================================================
-def train_one_fold(model, Xtr, ytr, Xva, yva, device,
-                   num_epochs=100, batch_size=32,
-                   dense_units=None, fold=None, ticker=None):
-
-    print(f"      ▶ [DENSE {dense_units}] Training dimulai...")
+def train_one_fold(
+    model,
+    Xtr, ytr,
+    Xva, yva,
+    device,
+    num_epochs,
+    batch_size,
+    lr,
+    optimizer_name="Adam",
+    fold=None,
+    ticker=None,
+    comb_name=None,
+):
+    print(f"      ▶ Training dimulai | Ticker={ticker} | Subset={comb_name} | Fold={fold}")
+    print(f"        Hyperparams: epochs={num_epochs}, batch={batch_size}, lr={lr}, opt={optimizer_name}")
 
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    # Optimizer
+    if optimizer_name == "Adam":
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+    elif optimizer_name == "AdamW":
+        optimizer = optim.AdamW(model.parameters(), lr=lr)
+    elif optimizer_name == "RMSprop":
+        optimizer = optim.RMSprop(model.parameters(), lr=lr)
+    elif optimizer_name == "SGD":
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    else:
+        raise ValueError(f"Optimizer tidak dikenali: {optimizer_name}")
+
     criterion = RMSELoss()
 
     Xtr_t = torch.tensor(Xtr, dtype=torch.float32).to(device)
@@ -253,19 +275,20 @@ def train_one_fold(model, Xtr, ytr, Xva, yva, device,
     n_train = Xtr_t.size(0)
 
     train_losses, val_losses, val_maes = [], [], []
+
     best_val_loss = float("inf")
     best_epoch = 0
     best_pred = None
+    best_state = None
 
     for epoch in range(num_epochs):
-
         # TRAIN
         model.train()
         perm = torch.randperm(n_train)
         epoch_loss = 0.0
 
         for i in range(0, n_train, batch_size):
-            idx = perm[i:i+batch_size]
+            idx = perm[i:i + batch_size]
             batch_X = Xtr_t[idx]
             batch_y = ytr_t[idx]
 
@@ -294,17 +317,17 @@ def train_one_fold(model, Xtr, ytr, Xva, yva, device,
                 best_val_loss = vloss
                 best_epoch = epoch
                 best_pred = pred_va.detach().cpu().numpy()
+                best_state = model.state_dict()
 
-        # LOG PER 10 EPOCH
         if (epoch + 1) % 10 == 0:
             print(
-                f"        [Fold {fold}] [Dense {dense_units}] "
-                f"Epoch {epoch+1}/100 | Train={epoch_loss:.6f} | Val={vloss:.6f}"
+                f"        [Fold {fold}] Epoch {epoch+1}/{num_epochs} "
+                f"| Train={epoch_loss:.6f} | Val(RMSE)={vloss:.6f} | MAE={mae:.6f}"
             )
 
-    print(f"      ✔ [DENSE {dense_units}] selesai — Best Loss={best_val_loss:.6f} di Epoch {best_epoch+1}")
-    return train_losses, val_losses, val_maes, best_epoch, best_pred
+    print(f"      ✔ Fold {fold} selesai — Best Val(RMSE)={best_val_loss:.6f} di Epoch {best_epoch+1}")
 
+    return train_losses, val_losses, val_maes, best_epoch, best_pred, best_state
 
 # ======================================================
 # 📌 Training Utama

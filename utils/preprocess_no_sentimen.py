@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
+
 from numpy.lib.stride_tricks import sliding_window_view
 from typing import Tuple, Optional, List, Dict
 from config import (
@@ -8,6 +9,9 @@ from config import (
     TRAIN_RATIO, VAL_RATIO,
     MA_PERIODS, EMA_PERIODS, RSI_PERIODS, MACD_CONFIGS
 )
+
+
+
 
 # ================================================================
 # 1. LOAD CSV
@@ -111,19 +115,27 @@ def prepare_sequences(
     scaler_dict: Optional[Dict[str, object]] = None,
     step_size: int = 1,
 ):
-
     # 1. Ambil fitur numerik
     data_num, cols = select_numeric_matrix(df, target_col=target_col_name, feature_subset=feature_subset)
     data_df = pd.DataFrame(data_num, columns=cols)
+
+    # Print dimensi data sebelum scaling
+    print(f"Dimensi data numerik (sebelum scaling): {data_df.shape}")
 
     # 2. Scaling fitur
     fit_mode = scaler_dict is None
     data_scaled_df, scaler_dict = fit_scale(data_df, scaler_dict, fit=fit_mode)
     data_scaled = data_scaled_df.values
 
+    # Print dimensi data setelah scaling
+    print(f"Dimensi data yang sudah discale: {data_scaled.shape}")
+
     # 3. TARGET asli & scaling target
     tgt = df[target_col_name].values
     tgt_scaled, scaler_dict = scale_target(tgt, scaler_dict, fit=fit_mode)
+
+    # Print dimensi target setelah scaling
+    print(f"Dimensi target yang sudah discale: {tgt_scaled.shape}")
 
     T, F = data_scaled.shape
     needed = N_STEPS + horizon
@@ -132,6 +144,7 @@ def prepare_sequences(
 
     # 4. Buat window X
     X_full = sliding_window_view(data_scaled, (N_STEPS, F))[:, 0, :, :]
+    print(f"Dimensi X_full (window): {X_full.shape}")
 
     # 5. Buat window Y (scaled)
     y_list = []
@@ -142,8 +155,11 @@ def prepare_sequences(
     X = X_full[:max_start:step_size]
     y = np.stack(y_list, axis=0)
 
-    return X, y, scaler_dict, cols
+    # Print dimensi X dan Y yang telah diproses
+    print(f"Dimensi X (data window): {X.shape}")
+    print(f"Dimensi Y (target window): {y.shape}")
 
+    return X, y, scaler_dict, cols
 
 # ================================================================
 # 7. SPLIT (Hybrid)
