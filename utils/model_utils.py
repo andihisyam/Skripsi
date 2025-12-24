@@ -1,4 +1,5 @@
 from sklearn.base import BaseEstimator, RegressorMixin
+from torch.utils.data import DataLoader, TensorDataset
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -66,7 +67,7 @@ def build_lstm_model(Xtr, dense_units=64, hidden_units=128, dropout=0.3, output_
 
 # Pembungkus untuk LSTM yang kompatibel dengan GridSearchCV
 class LSTMRegressorSklearn(BaseEstimator, RegressorMixin):
-    def __init__(self, dense_units=64, hidden_units=128, dropout=0.3, lr=1e-3, optimizer='Adam', batch_size=32,epochs=100):
+    def __init__(self, dense_units=64, hidden_units=128, dropout=0.3, lr=1e-3, optimizer='Adam', batch_size=32,epochs=100,verbose=False):
         # Store necessary parameters
         self.dense_units = dense_units
         self.hidden_units = hidden_units
@@ -76,18 +77,17 @@ class LSTMRegressorSklearn(BaseEstimator, RegressorMixin):
         self.batch_size = batch_size
         self.epochs = epochs
         self.model = None  # LSTM model
+        self.verbose=verbose
         self.optimizer = optimizer
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def fit(self, X, y):
         # Ubah data menjadi tensor
-        X = torch.tensor(X, dtype=torch.float32)
-        y = torch.tensor(y, dtype=torch.float32)
-
-        # Print dimensi data sebelum masuk ke model
-        print(f"Dimensi data X: {X.shape}, Dimensi target y: {y.shape}")
+        X_tensor = torch.tensor(X, dtype=torch.float32)
+        y_tensor = torch.tensor(y, dtype=torch.float32)
 
         # Inisialisasi model LSTM
-        input_size = X.shape[2]  # Menentukan input_size berdasarkan data (dimensi terakhir dari data X)
+        input_size = X_tensor.shape[2]  # Menentukan input_size berdasarkan data 
         
         # Berikan input_size pada inisialisasi model
         self.model = LSTMRegressor(input_size=input_size, 
@@ -95,46 +95,39 @@ class LSTMRegressorSklearn(BaseEstimator, RegressorMixin):
                                 hidden_units=self.hidden_units, 
                                 dropout=self.dropout, 
                                 output_dim=22
-                                )
+                                ).to(self.device)
 
         # Tentukan optimizer dan loss function
         optimizer = getattr(optim, self.optimizer_name)(self.model.parameters(), lr=self.lr)
         criterion = nn.MSELoss()
 
         # Training loop
-        for epoch in range(100):  # Misalnya train selama 100 epoch
-            self.model.train()
+        self.model.train()
+        for epoch in range(self.epochs):
             optimizer.zero_grad()
+            outputs = self.model(X_tensor.to(self.device))
+            target = y_tensor.to(self.device)
+            
+            if outputs.shape != target.shape:
+                target = target.view(outputs.shape)
 
-            # Lakukan prediksi
-            outputs = self.model(X)
-
-            # Print dimensi output model dan target sebelum perhitungan loss
-            print(f"Dimensi output model: {outputs.shape}, Dimensi target y: {y.shape}")
-
-            # Jika output dan target tidak sesuai, perbaiki dengan reshape
-            if outputs.shape != y.shape:
-                print(f"Dimensi mismatch: Output {outputs.shape} vs Target {y.shape}")
-                y = y.view(-1, 22)  # reshape y menjadi (batch_size, 1) jika perlu
-
-            # Perhitungan loss
-            loss = criterion(outputs, y)
+            loss = criterion(outputs, target)
             loss.backward()
             optimizer.step()
 
-            # Print setiap epoch untuk memantau progress
-            print(f"Epoch {epoch+1}/{100}, Loss: {loss.item()}")
+            # Print loss
+            if self.verbose and (epoch + 1) % 50 == 0:
+                print(f"Epoch {epoch+1}/{self.epochs}, Loss: {loss.item():.6f}")
 
         return self
 
 
     def predict(self, X):
-        # Prediction with the trained model
         self.model.eval()
-        X = torch.tensor(X, dtype=torch.float32)
+        X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
         with torch.no_grad():
-            predictions = self.model(X)
-        return predictions.detach().cpu().numpy()
+            predictions = self.model(X_tensor)
+        return predictions.cpu().numpy()
 
 
 # ======================
