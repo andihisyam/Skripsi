@@ -1,2 +1,0 @@
-Jumlah ticker: 47
-Rentang tanggal prices: 2015-03-02 .. 2025-02-28
